@@ -731,3 +731,134 @@ Normal creation of new `(seriesId, bucketStart)` keys occurs within the existing
 ## Mental model
 
 > `bucketStart` identifies a short-lived state entry. Kafka's fixed partitions determine which processor owns that state entry. A new minute creates new state, not new infrastructure.
+
+# Kafka Two-Stage Metrics Aggregation
+
+## Correct mental model
+
+The two stages group records at different levels:
+
+1. **Stage 1 groups by metric series and service instance** to calculate ordered per-instance counter deltas.
+2. **Stage 2 groups by metric series and time bucket** to combine those deltas into service-level totals.
+
+## Stage 1: Metric series and service instance
+
+Stage 1 ensures that samples from the same metric series and service instance are processed in order by the same processor task.
+
+The key is typically:
+
+```text
+(seriesId, instanceId)
+```
+
+For example:
+
+```text
+(payment.requests, payment-instance-1)
+(payment.requests, payment-instance-2)
+(order.requests, order-instance-1)
+```
+
+Kafka might distribute these keys as follows:
+
+```text
+(payment.requests, payment-1) â†’ Kafka partition 3 â†’ Processor A
+(payment.requests, payment-2) â†’ Kafka partition 7 â†’ Processor B
+(order.requests, order-1)     â†’ Kafka partition 2 â†’ Processor C
+```
+
+Different instances of `payment-api` do not necessarily go to the same processor. This allows Stage 1 to:
+
+- Preserve ordering for each instance's cumulative counter.
+- Calculate each instance's request delta.
+- Distribute a service's work across processors.
+
+For example:
+
+```text
+payment-1: counter 1,000 â†’ 1,300 â†’ delta 300
+payment-2: counter 2,000 â†’ 2,450 â†’ delta 450
+```
+
+The two instances can be processed independently.
+
+Payments and orders may coincidentally map to the same physical Kafka partition because Kafka has a finite number of partitions. They remain separate logical keys and state entries:
+
+```text
+Processor A state:
+    (payment.requests, payment-1) â†’ previous counter 1,300
+    (order.requests, order-4)     â†’ previous counter 8,700
+```
+
+Sharing a processor does not cause the values to be aggregated together.
+
+> Stage 1 ensures that samples for the same metric series and service instance are processed in order by the same processor task, allowing safe counter-delta calculation.
+
+## Stage 2: Metric series and time bucket
+
+Stage 2 ensures that partial results for the same metric series and time bucket are processed by the same processor task.
+
+The key is:
+
+```text
+(seriesId, bucketStart)
+```
+
+For example:
+
+```text
+(payment.requests, 12:00)
+(order.requests,   12:00)
+(payment.requests, 12:01)
+```
+
+The records might be distributed as follows:
+
+```text
+(payment.requests, 12:00) â†’ Kafka partition 5 â†’ Processor X
+(order.requests,   12:00) â†’ Kafka partition 9 â†’ Processor Y
+(payment.requests, 12:01) â†’ Kafka partition 2 â†’ Processor Z
+```
+
+Stage 2 does not send every metric from `12:00` to one processor. That would create a hot partition. It sends every partial belonging to the same series and minute to the same task.
+
+Suppose Stage 1 emits:
+
+```text
+payment-1 â†’ payment.requests, 12:00, count=300
+payment-2 â†’ payment.requests, 12:00, count=450
+payment-3 â†’ payment.requests, 12:00, count=275
+order-1   â†’ order.requests,   12:00, count=600
+```
+
+Stage 2 calculates:
+
+```text
+(payment.requests, 12:00) â†’ 300 + 450 + 275 â†’ total 1,025
+(order.requests,   12:00) â†’ 600             â†’ total   600
+```
+
+> Stage 2 ensures that partial results for the same metric series and time bucket are processed by the same processor task, allowing the service-level bucket total to be calculated.
+
+## Complete Flow
+
+```mermaid
+flowchart LR
+    A[Payment instance 1] --> S1A[Stage 1: delta 300]
+    B[Payment instance 2] --> S1B[Stage 1: delta 450]
+    C[Order instance 1] --> S1C[Stage 1: delta 600]
+
+    S1A --> P[Stage 2: payment, 12:00]
+    S1B --> P
+    S1C --> O[Stage 2: order, 12:00]
+
+    P --> PT[Payment total: 750]
+    O --> OT[Order total: 600]
+```
+
+## Summary
+
+1. **Stage 1 groups by metric series and instance** to calculate ordered per-instance deltas.
+2. **Stage 2 groups by metric series and time bucket** to combine instance deltas into a service-level bucket total.
+
+Neither stage reserves one processor exclusively for a service or minute. Each processor handles many logical keys. Kafka guarantees that records with the same key reach the same Kafka partition and therefore the same active consumer task.
