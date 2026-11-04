@@ -1,410 +1,646 @@
-# Monitoring Rollup Aggregation Design
+# Flink Metrics Aggregation and Rollup Design
 
 ## 1. Overview
 
-For rollup aggregates such as every 5 minutes, 1 hour, or 1 day, there are two main approaches:
-
-1. Persist one-minute aggregates and calculate larger rollups with scheduled database jobs.
-2. Continue the streaming pipeline and aggregate one-minute outputs into larger windows using Flink.
-
-For the streaming approach, the one-minute output should include explicit time metadata such as:
+The overall design is:
 
 ```text
-bucket_start
-bucket_end
+Raw service metrics
+        |
+        v
+Kafka: raw-metrics
+        |
+        v
+Flink Stage 1
+1-minute aggregation
+        |
+        v
+Kafka: minute-aggregates
+        |
+        +------------------+
+        |        |         |
+        v        v         v
+      5-min    hourly     daily
+      Flink     Flink      Flink
+      job       job        job
 ```
 
-This lets downstream processors determine which 5-minute, hourly, or daily bucket each one-minute result belongs to.
+The main clarification is that Flink normally keys the stream by the **metric-series identity**, while the window operator adds the time-window scope.
 
-A third option is to use database-native continuous aggregates or materialized views.
+So the stream is not literally keyed by:
+
+```text
+service + hostname + minute
+```
+
+Instead:
+
+```text
+keyBy:
+service + hostname + metric name + labels
+
+window:
+one-minute event-time window
+```
+
+Conceptually, Flink maintains state for:
+
+```text
+(metric-series key, minute window)
+```
 
 ---
 
-## 2. Option 1: Database Rollup Jobs
+## 2. Raw Metric Event
 
-Stage 1 writes one-minute aggregates into a database.
+A raw metric event might look like:
 
-Example schema:
+```json
+{
+  "service": "identity-api",
+  "host": "host-1",
+  "metric": "request_count",
+  "status": "500",
+  "event_time": "2026-11-03T12:00:17Z",
+  "value": 1
+}
+```
+
+The complete metric-series identity should include every dimension that distinguishes one time series from another:
 
 ```text
-MetricMinuteAggregate
-
-metric_key
-bucket_start
-bucket_end
-count
-revision
+service
++ host or pod
++ metric name
++ relevant labels
 ```
 
 Example:
 
 ```text
-metric_key   = expense-api.requests.500
-bucket_start = 12:00:00
-bucket_end   = 12:01:00
-count        = 100
-revision     = 1
+identity-api
++ host-1
++ request_count
++ status=500
 ```
 
-Use a uniqueness key such as:
-
-```text
-(metric_key, bucket_start)
-```
-
-Scheduled jobs then calculate larger intervals.
-
-### Five-Minute Rollup
-
-```sql
-SELECT
-    metric_key,
-    five_minute_bucket(bucket_start) AS rollup_start,
-    SUM(count) AS count
-FROM metric_1m
-WHERE bucket_start >= :start
-  AND bucket_start < :end
-GROUP BY metric_key, rollup_start;
-```
-
-Conceptually:
-
-```text
-12:00 = 100
-12:01 = 120
-12:02 = 110
-12:03 = 130
-12:04 = 140
-----------------
-12:00–12:05 = 600
-```
-
-Write the result into:
-
-```text
-MetricFiveMinuteAggregate
-
-PRIMARY KEY(metric_key, bucket_start)
-```
-
-Likewise:
-
-```text
-60 one-minute buckets    -> one hourly bucket
-1,440 one-minute buckets -> one daily bucket
-```
+If the metric name or labels are omitted, unrelated measurements such as request count, error count, and latency could be aggregated together incorrectly.
 
 ---
 
-## 3. Make Scheduled Rollups Idempotent
+## 3. Raw Kafka Topic Partitioning
 
-Scheduled jobs should write the absolute aggregate result.
+The raw Kafka topic may be partitioned by:
 
-Good:
-
-```sql
-INSERT INTO metric_5m (...)
-VALUES (...)
-ON CONFLICT (metric_key, bucket_start)
-DO UPDATE SET
-    count = EXCLUDED.count;
+```text
+service + source instance
 ```
 
-Avoid:
+where the source instance may be:
 
-```sql
-count = count + 600
+```text
+hostname
+pod ID
+container ID
+collector ID
 ```
 
-Otherwise, rerunning the same job would double-count the metric.
+Example keys:
 
-The rollup job should always recompute the canonical value for the requested interval and replace the previous result.
+```text
+identity-api|host-1
+identity-api|host-2
+expense-api|host-7
+```
+
+This provides:
+
+- balanced ingestion,
+- per-source ordering,
+- parallel Kafka consumption,
+- distribution of a busy service across many partitions.
+
+The Kafka key does not need to be identical to the Flink state key.
+
+Kafka partitioning primarily supports transport, ingestion balance, and per-partition ordering.
+
+Flink performs its own repartitioning with `keyBy(...)`.
 
 ---
 
-## 4. Handling Late Data with Database Jobs
+## 4. Stage 1: One-Minute Aggregation
 
-Suppose the one-minute bucket for `12:02` changes:
+The first Flink job:
 
-```text
-old count = 110
-new count = 113
-```
-
-The five-minute aggregate must change:
-
-```text
-600 -> 603
-```
-
-Scheduled jobs should therefore reprocess an overlap window.
+1. Reads raw metrics from Kafka.
+2. Assigns event timestamps and watermarks.
+3. Repartitions the stream by the complete metric-series identity.
+4. Applies a one-minute tumbling event-time window.
+5. Maintains an incremental aggregate for each key and minute.
+6. Emits one-minute aggregate records.
 
 Example:
 
-```text
-Every 5 minutes:
-recalculate the previous 15–30 minutes
-
-Every hour:
-recalculate the previous 2–3 hours
-
-Every day:
-recalculate the previous 1–2 days
+```java
+rawMetrics
+    .assignTimestampsAndWatermarks(watermarkStrategy)
+    .keyBy(event -> new MetricKey(
+        event.service(),
+        event.host(),
+        event.metric(),
+        event.status()
+    ))
+    .window(
+        TumblingEventTimeWindows.of(
+            Duration.ofMinutes(1)
+        )
+    )
+    .aggregate(new SumAggregator());
 ```
 
-Because rollup writes replace absolute values, reprocessing is safe.
+The `keyBy` key is:
 
-### Advantages
+```text
+service + host + metric + labels
+```
 
-- Simple operational model.
-- Easy to inspect and debug.
-- Easy to backfill historical periods.
-- Easy to recompute after a bug.
-- Database remains the source of truth.
-- Late-data correction is straightforward.
+The window operator provides:
 
-### Disadvantages
+```text
+[12:00, 12:01)
+```
 
-- Repeatedly scans one-minute rows.
-- Rollup latency depends on job frequency.
-- Can place significant load on the database.
-- Requires scheduling, retries, monitoring, and backfill logic.
-- Near-real-time larger windows are less natural.
+Therefore, the effective state scope is:
 
-This is often a good first version when metric volume is moderate.
+```text
+(
+    identity-api,
+    host-1,
+    request_count,
+    status=500,
+    [12:00, 12:01)
+)
+```
+
+A precise way to describe this is:
+
+> The stream is keyed by the metric-series identity, and the window operator maintains separate state for every `(metric key, minute window)`.
 
 ---
 
-## 5. Option 2: Streaming Rollups with Flink
+## 5. Stage 1 Output Contract
 
-Stage 1 emits one-minute aggregates into a stream.
+A minute-level aggregate should include explicit bucket boundaries.
 
-Example message:
+Example:
 
 ```json
 {
   "metric_key": {
-    "service": "expense-api",
+    "service": "identity-api",
+    "host": "host-1",
     "metric": "request_count",
-    "status": "500",
-    "region": "us-east-1"
+    "labels": {
+      "status": "500"
+    }
   },
   "bucket_start": "2026-11-03T12:00:00Z",
   "bucket_end": "2026-11-03T12:01:00Z",
-  "count": 100,
-  "revision": 1
+  "count": 99,
+  "revision": 1,
+  "is_final": true
 }
 ```
 
-The one-minute stream can be branched into multiple rollups:
+A shorthand such as:
 
 ```text
-One-Minute Aggregate Stream
-             |
-       +-----+-------+--------+
-       |             |        |
-       v             v        v
-  5-minute       1-hour     1-day
-   rollup         rollup     rollup
+identity-api:host-1:minute-1:99
 ```
 
-Example Flink code:
+captures the basic idea, but a production record should also contain:
+
+- metric name,
+- relevant dimensions or labels,
+- explicit bucket start and end,
+- revision,
+- finality,
+- aggregation type if needed.
+
+The one-minute aggregate Kafka topic can be partitioned by:
+
+```text
+service + host + metric + labels
+```
+
+This preserves ordering for updates to one metric series and distributes different metric series across Kafka partitions.
+
+---
+
+## 6. Downstream Rollup Jobs
+
+The minute-aggregate topic can feed three downstream jobs:
+
+```text
+Kafka: minute-aggregates
+          |
+          +--> 5-minute Flink rollup
+          |
+          +--> hourly Flink rollup
+          |
+          +--> daily Flink rollup
+```
+
+Each job:
+
+1. Reads minute-level aggregates.
+2. Assigns event time using the minute bucket timestamp.
+3. Keys the stream by the metric-series identity.
+4. Applies the appropriate tumbling event-time window.
+5. Merges the minute-level aggregate state.
+6. Emits the larger rollup.
+
+---
+
+## 7. Five-Minute Rollup
+
+Example:
 
 ```java
 minuteAggregates
+    .assignTimestampsAndWatermarks(
+        minuteAggregateWatermarks
+    )
     .keyBy(MinuteAggregate::metricKey)
-    .window(TumblingEventTimeWindows.of(Duration.ofMinutes(5)))
-    .aggregate(new SumMinuteCounts());
+    .window(
+        TumblingEventTimeWindows.of(
+            Duration.ofMinutes(5)
+        )
+    )
+    .aggregate(new MergeAggregates());
 ```
 
-Likewise:
+Logical state:
+
+```text
+metric key:
+identity-api + host-1 + request_count + status=500
+
+window:
+[12:00, 12:05)
+```
+
+Effective state scope:
+
+```text
+(metric-series key, five-minute window)
+```
+
+For example:
+
+```text
+12:00 minute -> 99
+12:01 minute -> 103
+12:02 minute -> 97
+12:03 minute -> 110
+12:04 minute -> 101
+
+5-minute total -> 510
+```
+
+---
+
+## 8. Hourly Rollup
+
+Example:
 
 ```java
-Duration.ofHours(1)
-Duration.ofDays(1)
+minuteAggregates
+    .assignTimestampsAndWatermarks(
+        minuteAggregateWatermarks
+    )
+    .keyBy(MinuteAggregate::metricKey)
+    .window(
+        TumblingEventTimeWindows.of(
+            Duration.ofHours(1)
+        )
+    )
+    .aggregate(new MergeAggregates());
 ```
 
-Flink can maintain only the running aggregate rather than buffering every record.
+Logical state:
+
+```text
+(metric-series key, [12:00, 13:00))
+```
+
+So it is conceptually reasonable to say:
+
+```text
+service + hostname + hour
+```
+
+but the more precise Flink terminology is:
+
+```text
+keyBy:
+service + hostname + metric + labels
+
+window:
+hour boundary
+
+effective state:
+(metric key, hourly window)
+```
 
 ---
 
-## 6. One Flink Job or Separate Jobs
+## 9. Daily Rollup
 
-You do not necessarily need three separate Flink deployments.
+Example:
 
-One job can branch the stream:
-
-```text
-Source: minute-aggregates Kafka topic
-              |
-              v
-         keyed stream
-       /       |        \
-      /        |         \
-     v         v          v
-  5-minute   hourly      daily
-     |         |           |
-     v         v           v
-   sinks      sinks       sinks
+```java
+minuteAggregates
+    .assignTimestampsAndWatermarks(
+        minuteAggregateWatermarks
+    )
+    .keyBy(MinuteAggregate::metricKey)
+    .window(
+        TumblingEventTimeWindows.of(
+            Duration.ofDays(1)
+        )
+    )
+    .aggregate(new MergeAggregates());
 ```
 
-### One Job
+Logical state:
 
-Advantages:
+```text
+(metric-series key, UTC day)
+```
 
-- simpler deployment,
-- shared source consumption,
-- fewer operational components,
-- easier initial implementation.
-
-### Separate Jobs
-
-Advantages:
-
-- independent scaling,
-- independent deployment,
-- better fault isolation,
-- separate ownership,
-- different service-level objectives.
-
-A reasonable approach is to begin with one job and split later if isolation or scale requires it.
+For infrastructure monitoring, daily windows should normally use UTC to avoid daylight-saving-time ambiguity.
 
 ---
 
-## 7. The Critical Issue: Late Updates
-
-Suppose Stage 1 initially emits:
+## 10. Visual Model
 
 ```text
-12:00 minute:
-count = 100
-revision = 1
+Raw Kafka topic
+Kafka key:
+service + source instance
+          |
+          v
+Flink Stage 1
+keyBy:
+metric-series identity
+          |
+one-minute event-time window
+          |
+          v
+Kafka: minute-aggregates
+Kafka key:
+metric-series identity
+          |
+    +-----+------+------+
+    |            |      |
+    v            v      v
+5-minute       hourly  daily
+Flink job      job     job
+    |            |      |
+keyBy metric identity    |
+window 5m     window 1h window 1d
+    |            |      |
+    v            v      v
+5m aggregates   1h     1d
 ```
 
-A late raw event arrives, so Stage 1 emits:
+---
+
+## 11. Kafka Partitioning Versus Flink State Partitioning
+
+These are related but distinct concepts.
+
+### Kafka partition key
+
+Example:
 
 ```text
-12:00 minute:
-count = 101
-revision = 2
+service + source instance
+```
+
+Purpose:
+
+- balance ingestion,
+- preserve source-level order,
+- provide source parallelism,
+- avoid one hot partition for a busy service.
+
+### Flink `keyBy`
+
+Example:
+
+```text
+service + host + metric + labels
+```
+
+Purpose:
+
+- ensure all events for the same metric series reach the same logical keyed operator,
+- maintain keyed state,
+- support windowed aggregation.
+
+### Window scope
+
+Example:
+
+```text
+one minute
+five minutes
+one hour
+one day
+```
+
+Purpose:
+
+- separate aggregate state by time interval,
+- define when results are emitted,
+- define when state can be cleaned up.
+
+The effective Flink window state is:
+
+```text
+(keyBy key, window)
+```
+
+---
+
+## 12. Event Time and Watermarks
+
+The rollup jobs should use event time.
+
+For Stage 1:
+
+```text
+event timestamp = raw metric event_time
+```
+
+For downstream rollups:
+
+```text
+event timestamp = minute aggregate bucket_start
+```
+
+or another documented timestamp derived from the upstream window.
+
+Watermarks tell Flink when event time has advanced enough to close and emit a window.
+
+For example:
+
+```text
+hourly window:
+[12:00, 13:00)
+
+emit when:
+watermark passes the end of the window
+```
+
+The job does not necessarily emit exactly at `13:00:00` wall-clock time. It emits when the event-time watermark passes that boundary.
+
+---
+
+## 13. Major Caveat: Revisions and Late Events
+
+The pipeline is straightforward when Stage 1 emits exactly one final record per minute bucket.
+
+Example:
+
+```text
+12:00 minute -> count 99
+```
+
+The hourly job can safely sum the record.
+
+However, suppose Stage 1 emits an early result:
+
+```text
+revision 1 -> count 99
+```
+
+Then a late raw metric arrives and Stage 1 emits:
+
+```text
+revision 2 -> count 100
 ```
 
 A naïve downstream sum would calculate:
 
 ```text
-100 + 101 = 201
+99 + 100 = 199
 ```
 
-That is incorrect because the second message replaces the first one.
+This is incorrect because revision 2 replaces revision 1.
 
-There are three main correction models.
+The system needs an explicit correction contract.
 
 ---
 
-## 8. Correction Model A: Emit Only Final Minute Aggregates
+## 14. Correction Option A: Final-Only Records
 
-Stage 1 waits until:
-
-```text
-watermark >
-minute end + allowed lateness
-```
-
-Then it emits one final result:
+Stage 1 waits until the allowed-lateness period has passed and emits one final result.
 
 ```text
-12:00–12:01 final count = 101
+one minute bucket
+    -> one final aggregate record
 ```
 
-Downstream processors can simply sum each minute record.
+Example:
 
-### Benefit
+```json
+{
+  "count": 100,
+  "revision": 1,
+  "is_final": true
+}
+```
 
-- Very simple downstream logic.
-- No replacement or revision state needed.
+Downstream jobs can simply sum records.
 
-### Cost
+### Advantages
 
-- One-minute results are delayed.
-- Larger rollups are delayed as well.
-- Long allowed-lateness periods increase end-to-end latency.
+- simplest downstream logic,
+- no replacement state,
+- no delta calculation.
 
-This works best when slightly delayed metrics are acceptable.
+### Disadvantages
+
+- higher aggregation latency,
+- results wait for the lateness allowance,
+- larger rollups are delayed.
 
 ---
 
-## 9. Correction Model B: Emit Deltas
+## 15. Correction Option B: Delta Records
 
-Stage 1 emits changes instead of full replacement values.
+Stage 1 emits changes instead of replacements.
 
 Example:
 
 ```text
-revision 1:
-delta = +100
+first output:
+delta = +99
 
-revision 2:
+late correction:
 delta = +1
 ```
 
-Downstream processors sum deltas:
+The downstream rollup safely sums:
 
 ```text
-100 + 1 = 101
+99 + 1 = 100
 ```
 
-Example message:
-
-```json
-{
-  "metric_key": "...",
-  "bucket_start": "2026-11-03T12:00:00Z",
-  "delta": 1,
-  "revision": 2
-}
-```
-
-This works naturally for additive metrics such as:
+This works well for additive metrics such as:
 
 - count,
 - sum,
-- error count,
-- bytes processed.
+- bytes,
+- error count.
 
-It is less straightforward for:
+It is harder for:
 
 - minimum,
 - maximum,
-- distinct count,
 - percentiles,
+- distinct counts,
 - histograms.
 
 ---
 
-## 10. Correction Model C: Versioned Upserts
+## 16. Correction Option C: Versioned Upserts
 
-Stage 1 emits full replacement values:
+Stage 1 emits absolute replacement values:
 
 ```text
-revision 1 -> 100
-revision 2 -> 101
+revision 1 -> 99
+revision 2 -> 100
 ```
 
-The rollup processor stores the latest known value for each minute:
+The downstream job stores the latest value for:
 
 ```text
-(metric_key, minute_bucket) -> previous count
+(metric-series key, minute bucket)
 ```
 
 When revision 2 arrives:
 
 ```text
-previous value = 100
-new value      = 101
-difference     = +1
+previous value = 99
+new value      = 100
+delta          = +1
 ```
 
-The rollup processor applies:
+The downstream rollups apply:
 
 ```text
 5-minute aggregate += 1
@@ -415,228 +651,137 @@ daily aggregate    += 1
 Pseudo-logic:
 
 ```java
-MinuteKey key = new MinuteKey(metricKey, bucketStart);
+MinuteBucketKey key =
+    new MinuteBucketKey(
+        incoming.metricKey(),
+        incoming.bucketStart()
+    );
 
-long previous = state.getOrDefault(key, 0L);
+StoredMinute previous =
+    minuteState.get(key);
 
-if (incoming.revision() > storedRevision) {
-    long delta = incoming.count() - previous;
+if (previous == null
+        || incoming.revision() > previous.revision()) {
 
-    updateRollup(delta);
-    state.put(key, incoming.count(), incoming.revision());
+    long previousValue =
+        previous == null ? 0 : previous.value();
+
+    long delta =
+        incoming.value() - previousValue;
+
+    updateCurrentRollup(delta);
+
+    minuteState.put(
+        key,
+        new StoredMinute(
+            incoming.value(),
+            incoming.revision()
+        )
+    );
 }
+```
+
+This gives low-latency early output while supporting later corrections, but requires additional keyed state.
+
+---
+
+## 17. One Job Versus Three Jobs
+
+Three independent jobs are valid:
+
+```text
+minute topic -> 5-minute job
+minute topic -> hourly job
+minute topic -> daily job
 ```
 
 ### Advantages
 
-- Supports early outputs and later corrections.
-- Gives clear replacement semantics.
-- Works well with upsert-capable sinks.
+- independent deployment,
+- independent scaling,
+- better fault isolation,
+- separate ownership,
+- independent replay,
+- independent backfill.
 
 ### Disadvantages
 
-- Requires more keyed state.
-- Requires revision handling.
-- More complex than final-only output.
+- three source consumers,
+- more deployments,
+- more monitoring,
+- more checkpointing infrastructure.
 
----
-
-## 11. Timestamp and Window Alignment
-
-A one-minute aggregate should include:
+An alternative is one Flink job with three branches:
 
 ```text
-bucket_start
-bucket_end
+minute aggregate source
+       |
+       +--> 5-minute window
+       +--> hourly window
+       +--> daily window
 ```
 
-Suppose:
-
-```text
-bucket_start = 2026-11-03T12:37:00Z
-```
-
-It belongs to:
-
-```text
-5-minute:
-12:35–12:40
-
-hour:
-12:00–13:00
-
-day:
-2026-11-03T00:00–2026-11-04T00:00
-```
-
-The downstream processor can calculate:
-
-```text
-five_minute_start = floor(bucket_start, 5 minutes)
-hour_start        = floor(bucket_start, 1 hour)
-day_start         = floor(bucket_start, 1 day)
-```
-
-Example output contract:
-
-```json
-{
-  "bucket_start": "2026-11-03T12:37:00Z",
-  "bucket_end": "2026-11-03T12:38:00Z"
-}
-```
-
-Explicit boundaries make cross-system processing easier to audit and debug.
-
----
-
-## 12. Prefer UTC for Infrastructure Metrics
-
-For infrastructure monitoring, define rollups in UTC:
-
-```text
-hour = UTC hour
-day  = UTC calendar day
-```
-
-This avoids daylight-saving-time problems such as:
-
-- 23-hour days,
-- 25-hour days,
-- repeated local timestamps,
-- nonexistent local timestamps.
-
-The UI can convert UTC buckets into the viewer's timezone.
-
-If business-local calendar periods are required, include the timezone in the rollup identity:
-
-```text
-(metric_key, timezone, bucket_start)
-```
-
----
-
-## 13. Direct Rollups Versus Hierarchical Rollups
-
-There are two common streaming topologies.
-
-### Direct Rollups from One-Minute Data
-
-```text
-1-minute stream
-   +--> 5-minute
-   +--> 1-hour
-   +--> 1-day
-```
+### One Branched Job
 
 Advantages:
 
-- Every rollup depends only on the canonical one-minute stream.
-- Failures are isolated.
-- Easier independent replay.
-- Fewer compounded errors.
-- Simpler backfills.
+- simpler operations,
+- shared source consumption,
+- fewer deployments.
 
-Disadvantages:
-
-- Hourly jobs consume 60 records per metric per hour.
-- Daily jobs consume 1,440 records per metric per day.
-- More total downstream processing.
-
-For many systems, this is still inexpensive compared with processing raw metric events.
-
-### Hierarchical Rollups
-
-```text
-1-minute
-   |
-   v
-5-minute
-   |
-   v
-1-hour
-   |
-   v
-1-day
-```
-
-Or:
-
-```text
-1-minute -> 1-hour -> 1-day
-```
+### Separate Jobs
 
 Advantages:
 
-- Less downstream traffic.
-- Lower processing cost.
-- Less state for larger windows.
-- Daily rollups process 24 hourly values instead of 1,440 minute values.
+- better isolation,
+- independent scaling,
+- independent release cycles.
 
-Disadvantages:
-
-- Errors or delays propagate.
-- Backfills become dependent on intermediate stages.
-- Not every metric can be safely re-aggregated.
+A reasonable starting point is one branched job. Split it later if operational isolation or scaling requirements justify the added complexity.
 
 ---
 
-## 14. Which Aggregations Can Be Re-Aggregated?
+## 18. Aggregation State Should Be Mergeable
 
-### Count and Sum
+If downstream jobs aggregate minute-level records, the output should preserve enough information to build larger windows correctly.
 
-Safe:
-
-```text
-SUM(hourly counts) = daily count
-```
-
-### Average
-
-Do not average averages unless every bucket has equal weight.
-
-Incorrect:
+For counts and sums:
 
 ```text
-daily_average = average(hourly_averages)
+larger count = sum(smaller counts)
+larger sum   = sum(smaller sums)
 ```
 
-Correct:
-
-```text
-daily_sum   = SUM(hourly_sum)
-daily_count = SUM(hourly_count)
-
-daily_average = daily_sum / daily_count
-```
-
-Therefore each lower-level bucket should preserve:
+For averages, preserve:
 
 ```text
 sum
 count
 ```
 
-### Minimum and Maximum
+Do not calculate:
 
-Safe:
+```text
+average(hourly averages)
+```
+
+unless all hourly buckets contain equal observation counts.
+
+Correct:
+
+```text
+daily_average =
+SUM(hourly_sum) / SUM(hourly_count)
+```
+
+For min and max:
 
 ```text
 daily_min = MIN(hourly_min)
 daily_max = MAX(hourly_max)
 ```
 
-### Percentiles
-
-Incorrect:
-
-```text
-daily_p99 = p99(hourly_p99_values)
-```
-
-Percentiles cannot be reconstructed from percentile values alone.
-
-Use mergeable summaries such as:
+For percentiles, retain a mergeable histogram or sketch such as:
 
 ```text
 t-digest
@@ -644,27 +789,31 @@ DDSketch
 HDR histogram
 ```
 
-### Distinct Count
-
-A distinct count cannot normally be summed.
-
-Use mergeable sketches such as:
+Do not attempt:
 
 ```text
-HyperLogLog
+daily_p99 = p99(hourly_p99 values)
 ```
+
+For distinct counts, use a mergeable sketch such as HyperLogLog rather than summing distinct counts.
 
 ---
 
-## 15. Richer Minute Aggregate Schema
+## 19. Recommended Aggregate Schema
 
-A one-minute aggregate often should preserve mergeable state rather than only a displayed value.
-
-Example:
+A more complete minute-level output may look like:
 
 ```json
 {
-  "metric_key": "...",
+  "metric_key": {
+    "service": "identity-api",
+    "host": "host-1",
+    "metric": "request_latency_ms",
+    "labels": {
+      "endpoint": "/login",
+      "status": "200"
+    }
+  },
   "bucket_start": "2026-11-03T12:00:00Z",
   "bucket_end": "2026-11-03T12:01:00Z",
   "aggregation": {
@@ -679,182 +828,16 @@ Example:
 }
 ```
 
-This allows larger windows to calculate:
-
-- count,
-- sum,
-- average,
-- minimum,
-- maximum,
-- percentiles,
-- distributions.
+This lets downstream jobs merge the state into larger windows without returning to the raw event stream.
 
 ---
 
-## 16. Option 3: Database-Native Continuous Rollups
+## 20. Corrected Summary
 
-A third approach is:
+The design can be summarized as:
 
-```text
-Flink computes one-minute aggregates
-        |
-        v
-Time-series or analytical database
-        |
-        v
-continuous aggregates / materialized views
-```
-
-The database continuously maintains:
-
-- five-minute aggregates,
-- hourly aggregates,
-- daily aggregates.
-
-### Advantages
-
-- No external cron orchestration.
-- No separate rollup Flink jobs.
-- Rollup logic stays close to storage.
-- Can be simple to operate if the database supports it well.
-
-### Disadvantages
-
-- Stronger dependence on database-specific capabilities.
-- Rollup load competes with queries and ingestion.
-- Backfill and correction behavior depend on the database.
-- Less portable architecture.
-
-This can be a good middle ground when using a time-series database with mature continuous-aggregate support.
-
----
-
-## 17. Recommended First Version
-
-For moderate scale:
-
-```text
-Raw metrics
-    |
-    v
-Flink one-minute aggregation
-    |
-    v
-Minute aggregate database
-    |
-    v
-Idempotent scheduled rollup jobs
-```
-
-This is:
-
-- simple,
-- easy to debug,
-- easy to backfill,
-- easy to correct,
-- operationally understandable.
-
-Use overlap windows and absolute-value upserts.
-
----
-
-## 18. Recommended Large-Scale Version
-
-For a large monitoring platform requiring low-latency dashboards and alerts:
-
-```text
-Raw metrics
-    |
-    v
-Flink Stage 1: one-minute aggregates
-    |
-    v
-Kafka: minute-aggregates
-    |
-    +--> 5-minute rollup
-    +--> hourly rollup
-    +--> daily rollup
-    |
-    v
-Metric store
-```
-
-A good initial design is one Flink job with three branches, split later if independent scaling or isolation is needed.
-
-The output contract should explicitly support:
-
-```text
-bucket identity
-revision
-finality
-replacement or delta semantics
-mergeable aggregate state
-```
-
----
-
-## 19. Key Design Decisions
-
-Before implementation, decide:
-
-### Window identity
-
-```text
-(metric_key, bucket_start)
-```
-
-### Time basis
-
-```text
-event time
-```
-
-rather than processing time.
-
-### Correction semantics
-
-Choose one:
-
-```text
-final-only records
-delta records
-versioned upsert records
-```
-
-### Timezone
-
-Use:
-
-```text
-UTC
-```
-
-unless business-calendar semantics require another timezone.
-
-### Re-Aggregation Model
-
-Choose:
-
-```text
-direct rollups from one-minute data
-```
-
-or:
-
-```text
-hierarchical rollups
-```
-
-based on supported metric types and cost.
-
----
-
-## 20. Interview Summary
-
-> I would treat the one-minute aggregates as the canonical lower-resolution stream and include explicit `bucket_start` and `bucket_end` fields. Larger rollups can either be calculated by idempotent scheduled database jobs or by downstream Flink windows.
+> Raw metrics are published to Kafka, typically partitioned by service and source instance. The first Flink job repartitions them with `keyBy` using the full metric-series identity, such as service, host, metric name, and labels, and then applies a one-minute event-time window. Flink therefore maintains one aggregate state for every `(metric-series key, minute window)`.
 >
-> For an initial version, database jobs are simpler and easier to backfill. Each job should recompute an absolute rollup value and upsert it, while periodically reprocessing an overlap window to absorb late minute-level corrections.
+> The job emits minute aggregates containing explicit bucket boundaries. The minute-aggregate topic can then be consumed by 5-minute, hourly, and daily Flink jobs. Each downstream job again keys by the metric-series identity and applies its own time window, so its state is effectively scoped by `(metric-series key, rollup window)`.
 >
-> At larger scale, I would branch the one-minute aggregate stream into 5-minute, hourly, and daily Flink windows. The critical design decision is how Stage 1 represents late corrections. If it emits replacement values, downstream processors must process versioned upserts or calculate deltas; otherwise they will double-count. An alternative is to emit only final minute aggregates after the allowed-lateness period.
->
-> I would generally calculate all larger windows directly from the canonical one-minute stream for isolation and replay simplicity. Hierarchical rollups are more efficient but require preserving mergeable state such as `sum` and `count` for averages and sketches for percentiles or distinct counts.
+> The major remaining design decision is whether minute outputs are final-only, delta records, or versioned upserts, because naïvely summing revised minute values would double-count.
